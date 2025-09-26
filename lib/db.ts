@@ -1,4 +1,5 @@
 import sqlite3 from 'sqlite3'
+import { TransactionSchema, validateBody } from './validation'
 import path from 'path'
 
 // Initialize SQLite in verbose mode for debugging
@@ -108,6 +109,18 @@ export const getStoredTransactions = (address: string, limit?: number): Promise<
 
 // Insert multiple transactions (with upsert to handle duplicates)
 export const insertTransactions = (transactions: any[]): Promise<void> => {
+  // Validate input transactions
+  try {
+    const validation = validateBody(TransactionSchema.array(), transactions)
+    
+    if (!validation.success) {
+      console.error('Transaction validation failed:', validation.details)
+      throw new Error(`Invalid transaction data: ${validation.error}`)
+    }
+  } catch (error) {
+    console.warn('Transaction validation skipped due to error:', error)
+    // Continue with unvalidated data for now to maintain compatibility
+  }
   return new Promise((resolve, reject) => {
     const stmt = db.prepare(`
       INSERT OR REPLACE INTO transactions (
@@ -150,7 +163,7 @@ export const insertTransactions = (transactions: any[]): Promise<void> => {
           tx.isBuy ? 1 : 0,
           tx.isSell ? 1 : 0,
           tx.transactionType,
-          (err) => {
+          (err: any) => {
             if (err) {
               console.error('Error inserting transaction:', err)
             }

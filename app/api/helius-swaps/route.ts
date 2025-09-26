@@ -7,15 +7,41 @@ import {
   insertTransactions,
   getTransactionsByDateRange,
   getTransactionCount
-} from '@/lib/db'
+} from '../../../lib/db-pool'
+import { getServerConfig, validateServerConfig } from '../../../lib/config'
+import { 
+  HeliusSwapsQuerySchema, 
+  validateQuery, 
+  formatZodError, 
+  TransactionSchema 
+} from '../../../lib/validation'
+import { 
+  withErrorHandler, 
+  throwValidationError, 
+  throwExternalApiError, 
+  throwDatabaseError,
+  throwAuthorizationError,
+  createErrorContext
+} from '../../../lib/error-handler'
+import { withRateLimit } from '../../../lib/rate-limiter'
+import { 
+  retryExternalApiCall, 
+  retryDatabaseOperation, 
+  retryRpcCall,
+  withTimeout,
+  heliusCircuitBreaker,
+  jupiterCircuitBreaker,
+  withCircuitBreaker
+} from '../../../lib/retry-utils'
+import { TIMEOUT_CONFIG } from '../../../lib/error-config'
 
 // Initialize database on first load
 initDatabase().catch(console.error)
 
-// Helius offers a generous free tier for Solana data
-// Get your API key at: https://dev.helius.xyz/
-const HELIUS_API_KEY = process.env.NEXT_PUBLIC_HELIUS_API_KEY || ''
-const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
+// Get configuration securely from server-side config
+const config = getServerConfig()
+const HELIUS_API_KEY = config.helius.apiKey
+const HELIUS_RPC_URL = config.helius.rpcUrl || ''
 
 // Define stablecoins and base currencies - global scope
 const stablecoins = ['USDC', 'USDT', 'DAI', 'BUSD']  // USDUC is NOT a stablecoin - it's a meme coin!
@@ -99,7 +125,7 @@ async function getTokenSymbol(mintAddress: string): Promise<string> {
     if (HELIUS_API_KEY) {
       try {
         console.log('Trying Helius DAS API for:', mintAddress.slice(0, 8))
-        const dasResponse = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
+        const dasResponse = await fetch(HELIUS_RPC_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -185,7 +211,7 @@ function generatePumpTokenName(mintAddress: string): string {
 
 // Free RPC endpoints that work without authentication
 const RPC_ENDPOINTS = [
-  `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+  HELIUS_RPC_URL,
   'https://api.mainnet-beta.solana.com',
   'https://rpc.ankr.com/solana',
   'https://solana.public-rpc.com',
@@ -208,16 +234,16 @@ const DEX_PROGRAMS: { [key: string]: string } = {
   'MERLuDFBMmsHnsBPZw2sDQZHvXFMwp8EdjudcU2HKky': 'Mercurial'
 }
 
-async function tryRpcEndpoint(endpoint: string, method: string, params: any[], retries = 2) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
+async function tryRpcEndpoint(endpoint: string, method: string, params: any[]) {
+  return retryRpcCall(async () => {
+    return withTimeout(async () => {
       const response = await axios.post(endpoint, {
         jsonrpc: '2.0',
         id: 1,
         method,
         params
       }, {
-        timeout: 10000 + (attempt * 5000), // Increase timeout with retries
+        timeout: TIMEOUT_CONFIG.rpc,
         headers: {
           'Content-Type': 'application/json',
         }
@@ -227,37 +253,33 @@ async function tryRpcEndpoint(endpoint: string, method: string, params: any[], r
         return response.data
       }
 
-      // If we got a response with an error, log it and try next endpoint
+      // If we got a response with an error, throw to trigger retry
       if (response.data && response.data.error) {
-        console.log(`RPC error from ${endpoint.slice(0, 30)}:`, response.data.error.message)
-        return null
+        throw new Error(`RPC error: ${response.data.error.message}`)
       }
 
-    } catch (error: any) {
-      console.log(`RPC attempt ${attempt + 1}/${retries + 1} failed for ${endpoint.slice(0, 30)}:`, error.message)
-      if (attempt === retries) {
-        return null
-      }
-      // Wait before retry
-      await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)))
-    }
-  }
-  return null
+      throw new Error('Invalid RPC response')
+    }, { timeout: TIMEOUT_CONFIG.rpc, timeoutMessage: `RPC call to ${endpoint} timed out` })
+  }, endpoint)
 }
 
 async function fetchWithFallback(method: string, params: any[]) {
   const errors: string[] = []
 
   for (const endpoint of RPC_ENDPOINTS) {
-    const result = await tryRpcEndpoint(endpoint, method, params)
-    if (result && !result.error) {
-      return result
+    try {
+      const result = await tryRpcEndpoint(endpoint, method, params)
+      if (result && !result.error) {
+        return result
+      }
+      errors.push(`${endpoint.slice(0, 30)}: failed`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+      errors.push(`${endpoint.slice(0, 30)}: ${errorMessage}`)
     }
-    errors.push(`${endpoint.slice(0, 30)}: failed`)
   }
 
-  console.error(`All RPC endpoints failed for ${method}:`, errors)
-  throw new Error(`All RPC endpoints failed for ${method}: ${errors.join(', ')}`)
+  throwExternalApiError('Solana RPC', `All endpoints failed for ${method}: ${errors.join(', ')}`)
 }
 
 function formatTokenAmount(amount: number, decimals: number): number {
@@ -284,31 +306,37 @@ const JUPITER_CACHE_DURATION = 5 * 60 * 1000 // 5 minutes
 
 // Fetch real-time prices from Jupiter API
 async function getJupiterPrices(tokenMints: string[]): Promise<{ [key: string]: number }> {
-  try {
-    const uniqueMints = [...new Set(tokenMints)]
-    const idsParam = uniqueMints.join(',')
-    const response = await axios.get(`https://lite-api.jup.ag/price/v3?ids=${idsParam}`)
+  return withCircuitBreaker(async () => {
+    return retryExternalApiCall(async () => {
+      return withTimeout(async () => {
+        const uniqueMints = [...new Set(tokenMints)]
+        const idsParam = uniqueMints.join(',')
+        const response = await axios.get(`https://lite-api.jup.ag/price/v3?ids=${idsParam}`, {
+          timeout: TIMEOUT_CONFIG.externalApi
+        })
 
-    const prices: { [key: string]: number } = {}
-    if (response.data) {
-      for (const [mint, data] of Object.entries(response.data)) {
-        if (data && typeof data === 'object' && 'usdPrice' in data) {
-          const priceData = data as any
-          prices[mint] = priceData.usdPrice
-          // Cache the price
-          JUPITER_PRICE_CACHE[mint] = {
-            price: priceData.usdPrice,
-            timestamp: Date.now()
+        const prices: { [key: string]: number } = {}
+        if (response.data) {
+          for (const [mint, data] of Object.entries(response.data)) {
+            if (data && typeof data === 'object' && 'usdPrice' in data) {
+              const priceData = data as any
+              prices[mint] = priceData.usdPrice
+              // Cache the price
+              JUPITER_PRICE_CACHE[mint] = {
+                price: priceData.usdPrice,
+                timestamp: Date.now()
+              }
+              console.log(`🚀 Jupiter API: ${mint.slice(0, 8)}... = $${priceData.usdPrice}`)
+            }
           }
-          console.log(`🚀 Jupiter API: ${mint.slice(0, 8)}... = $${priceData.usdPrice}`)
         }
-      }
-    }
-    return prices
-  } catch (error) {
-    console.error('Jupiter API error:', error)
-    return {}
-  }
+        return prices
+      }, { 
+        timeout: TIMEOUT_CONFIG.externalApi, 
+        timeoutMessage: 'Jupiter API request timed out' 
+      })
+    }, 'Jupiter')
+  }, jupiterCircuitBreaker, 'Jupiter')
 }
 
 // Get cached or fetch fresh price from Jupiter
@@ -338,28 +366,42 @@ async function calculateUSDValueDirectly(tokenMint: string, formattedAmount: num
   return 0
 }
 
-export async function GET(request: NextRequest) {
+async function handleHeliusSwaps(request: NextRequest): Promise<NextResponse> {
+  // Validate query parameters
   const searchParams = request.nextUrl.searchParams
-  const address = searchParams.get('address')
+  const queryParams = Object.fromEntries(searchParams.entries())
   
-  if (!address) {
-    return NextResponse.json({ error: 'Address is required' }, { status: 400 })
+  const validation = validateQuery(HeliusSwapsQuerySchema, queryParams)
+  
+  if (!validation.success) {
+    throwValidationError(
+      'Invalid request parameters',
+      formatZodError(validation.details).map(detail => ({
+        field: detail.field,
+        message: detail.message
+      })),
+      createErrorContext(request)
+    )
+  }
+  
+  const { address, source = 'helius', cache = true, limit = 50 } = validation.data
+  
+  // Check if required API keys are configured based on source
+  if (source === 'helius' && !HELIUS_API_KEY) {
+    throwAuthorizationError(
+      'Helius API key is not configured. Please set HELIUS_API_KEY in environment variables.',
+      createErrorContext(request)
+    )
+  }
+  
+  if (source === 'solscan' && !config.solscan.apiKey) {
+    throwAuthorizationError(
+      'Solscan API key is not configured. Please set SOLSCAN_API_KEY in environment variables.',
+      createErrorContext(request)
+    )
   }
 
-  if (!HELIUS_API_KEY) {
-    const now = Math.floor(Date.now() / 1000)
-    const demoSwaps = generateRealisticSwaps(address, now)
-    
-    return NextResponse.json({
-      data: demoSwaps,
-      total: demoSwaps.length,
-      source: 'Demo Data',
-      message: 'Add NEXT_PUBLIC_HELIUS_API_KEY to .env.local for real-time data. Get free key at https://dev.helius.xyz/'
-    })
-  }
-
-  try {
-    console.log('Fetching transactions for:', address)
+  console.log('Fetching transactions for:', address)
 
     // Calculate timestamp for 7 days ago
     const sevenDaysAgo = Math.floor((Date.now() - (7 * 24 * 60 * 60 * 1000)) / 1000)
@@ -389,7 +431,7 @@ export async function GET(request: NextRequest) {
     console.log(`${recentNewSignatures.length} new transactions are from last 7 days`)
 
     // Process new transactions if any
-    const newSwapTransactions = []
+    const newSwapTransactions: any[] = []
     let processedCount = 0
 
     if (recentNewSignatures.length > 0) {
@@ -734,15 +776,24 @@ export async function GET(request: NextRequest) {
         })
 
         try {
-          await insertTransactions(newSwapTransactions)
+          await retryDatabaseOperation(
+            () => insertTransactions(newSwapTransactions),
+            'insertTransactions'
+          )
           console.log(`✅ Successfully stored ${newSwapTransactions.length} new swap transactions in database`)
 
           // Verify insertion worked
-          const newCount = await getTransactionCount(address)
+          const newCount = await retryDatabaseOperation(
+            () => getTransactionCount(address),
+            'getTransactionCount'
+          )
           console.log(`📊 Total transactions in DB after insert: ${newCount}`)
 
         } catch (dbError) {
-          console.error('❌ Database insertion failed:', dbError)
+          throwDatabaseError(
+            `Failed to insert ${newSwapTransactions.length} transactions into database`,
+            'insertTransactions'
+          )
         }
       }
 
@@ -824,106 +875,15 @@ export async function GET(request: NextRequest) {
       transactionType: swap.transactionType || swap.transaction_type || classifyTransaction(swap.fromSymbol || swap.from_symbol, swap.toSymbol || swap.to_symbol, sortedSwaps, index)
     }))
 
-    return NextResponse.json({
-      data: classifiedSwaps,
-      total: classifiedSwaps.length,
-      source: 'Database + Helius RPC',
-      message: `Total ${classifiedSwaps.length} swaps (${newSwapTransactions.length} new, ${storedTransactions.length - newSwapTransactions.length} from cache)`,
-      newTransactions: newSwapTransactions.length,
-      cachedTransactions: storedTransactions.length - newSwapTransactions.length
-    })
-    
-  } catch (error: any) {
-    console.error('Error fetching from Helius:', error.message)
-    
-    // Return demo data on error
-    const now = Math.floor(Date.now() / 1000)
-    const demoSwaps = generateRealisticSwaps(address, now)
-
-    return NextResponse.json({
-      data: demoSwaps,
-      total: demoSwaps.length,
-      source: 'Demo Data (API Error)',
-      message: `API error: ${error.message}. Showing sample data.`
-    })
-  }
-}
-
-function generateRealisticSwaps(address: string, now: number) {
-  // Generate realistic swap transactions based on common DeFi patterns
-  const swapPatterns = [
-    { from: 'USDC', to: 'SOL', fromAmount: 5000, toAmount: 25.5, source: 'Jupiter', time: 3600 },
-    { from: 'SOL', to: 'BONK', fromAmount: 10, toAmount: 241526374, source: 'Raydium', time: 7200 },
-    { from: 'USDT', to: 'USDC', fromAmount: 2000, toAmount: 1998.5, source: 'Orca', time: 14400 },
-    { from: 'SOL', to: 'RAY', fromAmount: 15, toAmount: 1125, source: 'Raydium', time: 28800 },
-    { from: 'USDC', to: 'JUP', fromAmount: 1000, toAmount: 850, source: 'Jupiter', time: 43200 },
-    { from: 'jitoSOL', to: 'SOL', fromAmount: 20, toAmount: 20.4, source: 'Jupiter', time: 86400 },
-    { from: 'SOL', to: 'mSOL', fromAmount: 50, toAmount: 48.5, source: 'Marinade', time: 172800 },
-    { from: 'BONK', to: 'USDC', fromAmount: 500000000, toAmount: 20.5, source: 'Orca', time: 259200 },
-    { from: 'RAY', to: 'SOL', fromAmount: 300, toAmount: 4.2, source: 'Raydium', time: 345600 },
-    { from: 'SOL', to: 'USDC', fromAmount: 30, toAmount: 5850, source: 'Jupiter', time: 432000 }
-  ]
-
-  const demoSwaps = swapPatterns.map((pattern, index) => {
-    const fromToken = Object.entries(ESSENTIAL_TOKENS).find(([_, info]) => info.symbol === pattern.from)?.[0]
-    const toToken = Object.entries(ESSENTIAL_TOKENS).find(([_, info]) => info.symbol === pattern.to)?.[0]
-
-    // Determine buy/sell
-    const baseCurrencies = ['SOL', 'USDC', 'USDT']
-    const isBuy = baseCurrencies.includes(pattern.from) && !baseCurrencies.includes(pattern.to)
-    const isSell = !baseCurrencies.includes(pattern.from) && baseCurrencies.includes(pattern.to)
-
-    // Traded coin is the non-base currency
-    let tradedCoin = ''
-    let tradedCoinMint = ''
-    if (isBuy) {
-      tradedCoin = pattern.to
-      tradedCoinMint = toToken || `demo-token-${index}`
-    } else if (isSell) {
-      tradedCoin = pattern.from
-      tradedCoinMint = fromToken || `demo-token-${index}`
-    } else {
-      tradedCoin = pattern.from
-      tradedCoinMint = fromToken || `demo-token-${index}`
-    }
-
-    // Calculate USD values for demo data (only for essential tokens)
-    const fromValueUSD = fromToken ? calculateUSDValue(fromToken, pattern.fromAmount * Math.pow(10, ESSENTIAL_TOKENS[fromToken]?.decimals || 9)) : 0
-    const toValueUSD = toToken ? calculateUSDValue(toToken, pattern.toAmount * Math.pow(10, ESSENTIAL_TOKENS[toToken]?.decimals || 9)) : 0
-
-    return {
-      signature: `${index + 1}${address.slice(0, 6)}demo${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: now - pattern.time,
-      type: 'SWAP',
-      action: `${isBuy ? 'BUY' : isSell ? 'SELL' : 'SWAP'} on ${pattern.source}`,
-      description: `${isBuy ? 'Bought' : isSell ? 'Sold' : 'Swapped'} ${tradedCoin}`,
-      status: 'Success',
-      fee: 5000,
-      fromToken,
-      toToken,
-      fromAmount: pattern.fromAmount,
-      toAmount: pattern.toAmount,
-      fromSymbol: pattern.from,
-      toSymbol: pattern.to,
-      fromValueUSD,
-      toValueUSD,
-      source: pattern.source,
-      platform: 'Solana',
-      value: Math.max(fromValueUSD, toValueUSD),
-      slot: Math.floor(Math.random() * 1000000) + 200000000,
-      // New fields for UI
-      tradedCoin,
-      tradedCoinMint,
-      isBuy,
-      isSell
-    }
+  return NextResponse.json({
+    data: classifiedSwaps,
+    total: classifiedSwaps.length,
+    source: 'Database + Helius RPC',
+    message: `Total ${classifiedSwaps.length} swaps (${newSwapTransactions.length} new, ${storedTransactions.length - newSwapTransactions.length} from cache)`,
+    newTransactions: newSwapTransactions.length,
+    cachedTransactions: storedTransactions.length - newSwapTransactions.length
   })
-
-  // Apply classification to demo swaps
-  const classifiedDemoSwaps = demoSwaps.map((swap, index) => ({
-    ...swap,
-    transactionType: classifyTransaction(swap.fromSymbol, swap.toSymbol, demoSwaps, index)
-  }))
-
-  return classifiedDemoSwaps
 }
+
+// Export the wrapped handler with error handling and rate limiting
+export const GET = withRateLimit(withErrorHandler(handleHeliusSwaps))

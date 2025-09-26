@@ -1,8 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server'
 import axios from 'axios'
+import { getServerConfig } from '../../../lib/config'
+import { 
+  SolscanSwapsQuerySchema, 
+  validateQuery, 
+  formatZodError 
+} from '../../../lib/validation'
 
-const SOLSCAN_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjcmVhdGVkQXQiOjE3NTg3NTA0NTgzNDYsImVtYWlsIjoibWVjaHJpLmhvc3NAZ21haWwuY29tIiwiYWN0aW9uIjoidG9rZW4tYXBpIiwiYXBpVmVyc2lvbiI6InYyIiwiaWF0IjoxNzU4NzUwNDU4fQ.ershC5SSzshdCPot94WUHo0PpHuf6sAlxdBXOQo256Y'
-const SOLSCAN_API_BASE = 'https://pro-api.solscan.io/v2.0'
+// Get configuration securely from server-side config
+const config = getServerConfig()
+const SOLSCAN_API_KEY = config.solscan.apiKey
+const SOLSCAN_API_BASE = config.solscan.baseUrl
 
 // Token symbols mapping
 const TOKEN_SYMBOLS: { [key: string]: string } = {
@@ -30,11 +38,35 @@ const DEX_SOURCES: { [key: string]: string } = {
 }
 
 export async function GET(request: NextRequest) {
+  // Validate query parameters
   const searchParams = request.nextUrl.searchParams
-  const address = searchParams.get('address')
+  const queryParams = Object.fromEntries(searchParams.entries())
   
-  if (!address) {
-    return NextResponse.json({ error: 'Address is required' }, { status: 400 })
+  const validation = validateQuery(SolscanSwapsQuerySchema, queryParams)
+  
+  if (!validation.success) {
+    return NextResponse.json(
+      {
+        error: 'Invalid request parameters',
+        details: formatZodError(validation.details),
+        message: 'Please check your query parameters and try again'
+      },
+      { status: 400 }
+    )
+  }
+  
+  const { address, limit = 50 } = validation.data
+  
+  // Check if API key is configured
+  if (!SOLSCAN_API_KEY) {
+    return NextResponse.json(
+      { 
+        error: 'Solscan API is not configured', 
+        message: 'Please set SOLSCAN_API_KEY in environment variables.',
+        code: 'MISSING_API_KEY'
+      },
+      { status: 500 }
+    )
   }
 
   try {
